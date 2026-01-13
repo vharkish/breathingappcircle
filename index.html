@@ -1,0 +1,319 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Play, Timer, Volume2, Loader2, RotateCcw } from 'lucide-react';
+
+const App = () => {
+  const [isActive, setIsActive] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(120);
+  const [currentStep, setCurrentStep] = useState(-1);
+  const [mainText, setMainText] = useState("Welcome");
+  const [subText, setSubText] = useState("Ready to begin your journey?");
+  const [progress, setProgress] = useState(new Array(12).fill(0));
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [isFinished, setIsFinished] = useState(false);
+  
+  const timerRef = useRef(null);
+  const audioCache = useRef({});
+  const sequenceRunning = useRef(false);
+  const apiKey = ""; 
+
+  const scripts = [
+    "Welcome, let's begin your relaxation journey.",
+    "Breathe in through your nose and hold it.",
+    "Now, exhale through your mouth and relax.",
+    "Breathe in through your nose and hold it.",
+    "Exhale. breathe through your mouth.",
+    "Breathe in through your nose and hold it.",
+    "Exhale. you are doing awesome.",
+    "Breathe in through your nose and hold it.",
+    "Exhale. you are an amazing person.",
+    "Breathe in through your nose and hold it.",
+    "Exhale. you deserve the best in life.",
+    "Breathe in through your nose and hold it.",
+    "Great job, now relax and enjoy your day."
+  ];
+
+  const fetchWithRetry = async (url, options, retries = 5) => {
+    let delay = 1000;
+    for (let i = 0; i < retries; i++) {
+      try {
+        const response = await fetch(url, options);
+        if (response.ok) return response;
+        if (response.status === 429 || response.status >= 500) throw new Error();
+        return response;
+      } catch (err) {
+        if (i === retries - 1) throw err;
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
+      }
+    }
+  };
+
+  const prepareAudio = async (index) => {
+    const textToSpeak = scripts[index];
+    if (!textToSpeak) return null;
+    if (audioCache.current[index]) return audioCache.current[index];
+    
+    try {
+      const response = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `Say in a soft, ethereal, whispering female voice: ${textToSpeak}` }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } }
+          }
+        })
+      });
+
+      const data = await response.json();
+      const base64 = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64) return null;
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      
+      const buffer = new ArrayBuffer(44 + bytes.length);
+      const view = new DataView(buffer);
+      const writeStr = (o, s) => { for(let i=0; i<s.length; i++) view.setUint8(o+i, s.charCodeAt(i)); };
+      
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + bytes.length, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, 24000, true);
+      view.setUint32(28, 48000, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeStr(36, 'data');
+      view.setUint32(40, bytes.length, true);
+      new Uint8Array(buffer, 44).set(bytes);
+      
+      const blob = new Blob([buffer], { type: 'audio/wav' });
+      const audio = new Audio(URL.createObjectURL(blob));
+      audioCache.current[index] = audio;
+      return audio;
+    } catch (err) {
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    if (isActive && timeLeft > 0) {
+      timerRef.current = setInterval(() => {
+        setTimeLeft((prev) => Math.max(0, prev - 1));
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [isActive, timeLeft]);
+
+  const startSession = async () => {
+    setErrorMessage("");
+    setIsBuffering(true);
+    setIsFinished(false);
+    setProgress(new Array(12).fill(0));
+    setTimeLeft(120);
+    setCurrentStep(-1);
+    
+    try {
+      sequenceRunning.current = false;
+      const firstAudio = await prepareAudio(0);
+      if (!firstAudio) {
+        setErrorMessage("Service busy. Please try again.");
+        setIsBuffering(false);
+        return;
+      }
+      
+      setIsBuffering(false);
+      setIsActive(true);
+      sequenceRunning.current = true;
+      runSequence();
+    } catch (e) {
+      setErrorMessage("Connection interrupted.");
+      setIsBuffering(false);
+    }
+  };
+
+  const runSequence = async () => {
+    for (let i = 0; i < scripts.length; i++) {
+      if (!sequenceRunning.current) break;
+      
+      const isFinal = i === 12;
+      const isFirst = i === 0;
+      const isInhale = i % 2 !== 0 && !isFinal;
+      
+      setCurrentStep(i);
+      setMainText(isFirst ? "BEGIN" : isFinal ? "PEACE" : isInhale ? "INHALE" : "EXHALE");
+      setSubText(scripts[i]);
+
+      const audio = await prepareAudio(i);
+      if (audio && sequenceRunning.current) {
+        setIsSpeaking(true);
+        audio.onended = () => setIsSpeaking(false);
+        audio.play().catch(() => setIsSpeaking(false));
+      }
+
+      if (i + 1 < scripts.length) prepareAudio(i + 1);
+
+      if (i < 12) {
+        const startTime = Date.now();
+        const duration = i === 0 ? 5000 : 8000;
+        while (Date.now() - startTime < duration && sequenceRunning.current) {
+          const elapsed = Date.now() - startTime;
+          const percentage = Math.min((elapsed / duration) * 100, 100);
+          setProgress(prev => {
+            const next = [...prev];
+            next[i] = percentage;
+            return next;
+          });
+          await new Promise(r => setTimeout(r, 16));
+        }
+      } else {
+        await new Promise(r => setTimeout(r, 6000));
+      }
+    }
+    
+    if (sequenceRunning.current) {
+      setIsActive(false);
+      setIsFinished(true);
+      setMainText("RESTORED");
+      setSubText("Your session is complete. Return whenever you need peace.");
+      sequenceRunning.current = false;
+    }
+  };
+
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const getStepScale = () => {
+    if (!isActive || currentStep < 1 || currentStep === 12) return 1;
+    return currentStep % 2 !== 0 ? 1.4 : 0.85;
+  };
+
+  // Logic to determine active color theme
+  const isInhale = currentStep % 2 !== 0 && currentStep > 0 && currentStep < 12;
+  const isExhale = currentStep % 2 === 0 && currentStep > 0 && currentStep < 12;
+
+  return (
+    <div className="min-h-screen w-full bg-slate-950 flex items-center justify-center overflow-hidden font-sans text-slate-100 relative">
+      {/* Dynamic Background Overlay */}
+      <div className={`absolute inset-0 transition-colors duration-[4000ms] ease-in-out opacity-25 ${
+        isActive ? (isInhale ? 'bg-lime-500' : isExhale ? 'bg-cyan-500' : 'bg-indigo-900') : 'bg-indigo-900'
+      }`} />
+
+      {/* Particle Effects */}
+      <div className="absolute inset-0 pointer-events-none">
+        {[...Array(30)].map((_, i) => (
+          <div 
+            key={i}
+            className="absolute rounded-full bg-white/20 blur-[1px] transition-transform duration-[8000ms] ease-in-out"
+            style={{
+              width: Math.random() * 4 + 2 + 'px',
+              height: Math.random() * 4 + 2 + 'px',
+              left: Math.random() * 100 + '%',
+              top: Math.random() * 100 + '%',
+              transform: `translateY(${isActive && isInhale ? '-120px' : '60px'}) scale(${Math.random() * 0.5 + 0.5})`,
+              opacity: Math.random() * 0.5 + 0.2
+            }}
+          />
+        ))}
+      </div>
+
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <div 
+          className="relative transition-all duration-[8000ms] ease-in-out flex items-center justify-center"
+          style={{ transform: `scale(${getStepScale()})` }}
+        >
+          <div className="absolute w-[450px] h-[450px] rounded-full border border-white/5 animate-[spin_40s_linear_infinite]" />
+          
+          <svg viewBox="0 0 200 200" className="w-[320px] h-[320px] absolute opacity-40 animate-[spin_25s_linear_infinite_reverse]">
+            <path fill="url(#waveGradient)" d="M100,20C55.8,20,20,55.8,20,100s35.8,80,80,80s80-35.8,80-80S144.2,20,100,20z M100,160c-33.1,0-60-26.9-60-60s26.9-60,60-60s60,26.9,60,60S133.1,160,100,160z" />
+            <defs>
+              <linearGradient id="waveGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor={isInhale ? "#bef264" : "#22d3ee"} />
+                <stop offset="100%" stopColor={isInhale ? "#84cc16" : "#0891b2"} />
+              </linearGradient>
+            </defs>
+          </svg>
+
+          <div className={`w-56 h-56 rounded-full blur-[100px] transition-all duration-[4000ms] ${
+            isActive ? (isInhale ? 'bg-lime-400/40' : isExhale ? 'bg-cyan-400/40' : 'bg-indigo-400/20') : 'bg-indigo-400/20'
+          }`} />
+        </div>
+      </div>
+
+      <div className="max-w-md w-full p-8 text-center space-y-12 z-10">
+        <div className="flex justify-center items-center space-x-4">
+          <div className="bg-slate-900/50 backdrop-blur-xl border border-white/10 px-4 py-2 rounded-full flex items-center space-x-2">
+            {isSpeaking ? (
+              <Volume2 size={12} className={isInhale ? 'text-lime-400 animate-pulse' : 'text-cyan-400 animate-pulse'} />
+            ) : (
+              <div className={`w-1.5 h-1.5 rounded-full ${isActive ? (isInhale ? 'bg-lime-400' : 'bg-cyan-400') : 'bg-slate-500'} animate-pulse`} />
+            )}
+            <span className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-300">
+              {isSpeaking ? 'Guidance' : (isActive ? 'Active' : 'Standby')}
+            </span>
+          </div>
+          <div className="bg-slate-900/50 backdrop-blur-xl border border-white/10 px-4 py-2 rounded-full flex items-center space-x-2">
+            <Timer size={12} className="text-slate-400" />
+            <span className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-300">{formatTime(timeLeft)}</span>
+          </div>
+        </div>
+
+        <div className="space-y-6 relative">
+          {isBuffering && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/40 backdrop-blur-md z-20 space-y-4 rounded-xl">
+              <Loader2 className="animate-spin text-lime-400" size={40} />
+              <p className="text-lime-400 text-[10px] font-bold uppercase tracking-[0.3em]">Aligning Energy...</p>
+            </div>
+          )}
+          <h1 className={`text-6xl font-thin tracking-[0.4em] transition-all duration-[2000ms] uppercase ${
+            isActive ? (isInhale ? 'text-lime-300' : isExhale ? 'text-cyan-300' : 'text-white') : 'text-white'
+          }`}>
+            {mainText}
+          </h1>
+          <p className="text-slate-200 text-xl font-light italic min-h-[5rem] flex items-center justify-center px-4 leading-relaxed tracking-wide transition-colors duration-1000">
+            {subText}
+          </p>
+        </div>
+
+        <div className="flex w-full gap-2 px-2">
+          {progress.map((p, i) => (
+            <div key={i} className="h-1.5 flex-1 bg-slate-900/80 rounded-full overflow-hidden border border-white/5">
+              <div 
+                className={`h-full transition-all duration-[16ms] ease-linear ${i % 2 !== 0 ? 'bg-lime-400 shadow-[0_0_8px_rgba(163,230,53,0.5)]' : 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.5)]'}`}
+                style={{ width: `${p}%` }}
+              />
+            </div>
+          ))}
+        </div>
+
+        {!isActive && (
+          <div className="pt-8">
+            <button 
+              onClick={startSession}
+              disabled={isBuffering}
+              className="group relative inline-flex items-center justify-center px-12 py-5 font-bold tracking-[0.3em] text-white uppercase transition-all duration-300 border border-white/10 bg-white/5 backdrop-blur-md rounded-full hover:bg-white hover:text-slate-950 hover:scale-105 active:scale-95 disabled:opacity-50"
+            >
+              {isBuffering ? <Loader2 className="animate-spin mr-3" size={18} /> : (isFinished ? <RotateCcw size={18} className="mr-3" /> : <Play size={18} className="mr-3 fill-current" />)}
+              {isBuffering ? "Wait" : (isFinished ? "Recharge" : "Center")}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default App;
